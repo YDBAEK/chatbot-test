@@ -84,12 +84,12 @@ def print_messages():
 
 # ✅ 메인 실행
 def main():
-    st.set_page_config(page_title="AI 비서", layout="wide", page_icon="🤖")
+    st.set_page_config(page_title="AI 비서 백수석-엔지니어", layout="wide", page_icon="🤖")
 
     with st.container():
         st.image('./chatbot_logo.png', use_container_width=True)
         st.markdown('---')
-        st.title("안녕하세요! RAG를 활용한 'AI 비서 톡톡이' 입니다")
+        st.title("안녕하세요! RAG를 활용한 'AI 비서 백수석-엔지니어' 입니다")
 
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
@@ -125,7 +125,7 @@ def main():
                 "If you can't find the information from the PDF document, use the `web_search` tool for searching information from the web. "
                 "If the user’s question contains words like '최신', '현재', or '오늘', you must ALWAYS use the `web_search` tool to ensure real-time information is retrieved. "
                 "Please always include emojis in your responses with a friendly tone. "
-                "Your name is `AI 비서 톡톡이`. Please introduce yourself at the beginning of the conversation."),
+                "Your name is `AI 비서 백수석-엔지니어`. Please introduce yourself at the beginning of the conversation."),
                 ("placeholder", "{chat_history}"),
                 ("human", "{input} \n\n Be sure to include emoji in your responses."),
                 ("placeholder", "{agent_scratchpad}"),
@@ -137,7 +137,7 @@ def main():
         agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
         # 입력창
-        user_input = st.chat_input('질문이 무엇인가요?')
+        user_input = st.chat_input('어서오세요. 오늘은 어떤도움을 드릴까요?')
 
         if user_input:
             session_id = "default_session"
