@@ -1,118 +1,25 @@
 import os
-import tempfile
 import streamlit as st
-
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import FAISS
+from langchain.chat_models import ChatOpenAI
 from langchain.document_loaders import PyPDFLoader
-
-from langchain_community.utilities import SerpAPIWrapper
-from langchain.agents import Tool, create_tool_calling_agent, AgentExecutor
-
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.tools.retriever import create_retriever_tool
+from langchain.prompts import ChatPromptTemplate
+import tempfile
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_community.utilities import SerpAPIWrapper
+from langchain.agents import Tool
 
-from PIL import Image, ImageChops, ImageOps
-
-# ------------------ 전역 설정 ------------------
+# .env 파일 로드
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-
-# ------------------ 유틸: 16:9 패딩/리사이즈/여백 제거 ------------------
-def _fallback_resample():
-    """Pillow 버전에 따른 LANCZOS 폴백."""
-    try:
-        return Image.Resampling.LANCZOS
-    except AttributeError:
-        return Image.LANCZOS  # 구버전 Pillow
-
-def trim_uniform_border(img: Image.Image, tol: int = 10) -> Image.Image:
-    """
-    불투명 흰 여백 등 '균일 배경'을 자동 트리밍.
-    - 코너(0,0) 픽셀을 배경색으로 가정
-    - tol 기준으로 차이 나는 영역만 남기고 bbox 크롭
-    """
-    rgb = img.convert("RGB")
-    bg_color = rgb.getpixel((0, 0))
-    bg = Image.new("RGB", rgb.size, bg_color)
-    diff = ImageChops.difference(rgb, bg)
-    diff = ImageOps.grayscale(diff).point(lambda p: 255 if p > tol else 0)
-    bbox = diff.getbbox()
-    return img.crop(bbox) if bbox else img
-
-def pad_to_aspect(img: Image.Image, aspect: float = 16/9, bg=(255, 255, 255, 0)) -> Image.Image:
-    w, h = img.size
-    cur = w / h
-    if abs(cur - aspect) < 1e-3:
-        return img
-    if cur > aspect:
-        new_h = int(round(w / aspect)); new_w = w
-    else:
-        new_w = int(round(h * aspect)); new_h = h
-    canvas = Image.new("RGBA", (new_w, new_h), bg)
-    ox = (new_w - w) // 2; oy = (new_h - h) // 2
-    canvas.paste(img, (ox, oy), mask=img if img.mode == "RGBA" else None)
-    return canvas
-
-def load_hero_logo(path: str, target_width: int = 1920) -> Image.Image:
-    """
-    1) 투명 여백 크롭 → 2) 균일 배경 여백 트리밍(흰 여백 등) → 3) 16:9 패딩 → 4) LANCZOS 리사이즈
-    """
-    img = Image.open(path)
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-
-    # (1) 투명 여백
-    bbox = img.getchannel("A").getbbox()
-    if bbox:
-        img = img.crop(bbox)
-
-    # (2) 흰 여백 등 균일 여백 제거
-    img = trim_uniform_border(img, tol=10)
-
-    # (3) 16:9 패딩
-    img = pad_to_aspect(img, aspect=16/9)
-
-    # (4) 리사이즈 (가로 기준)
-    resample = _fallback_resample()
-    w, h = img.size
-    if w != target_width:
-        target_height = int(round(target_width * 9 / 16))
-        img = img.resize((target_width, target_height), resample=resample)
-    return img
-
-def render_logo(path: str):
-    """
-    - SVG면 PIL 경로를 우회하고 바로 표시
-    - Streamlit 버전 차이: width='stretch' → 실패 시 use_column_width=True
-    """
-    if path.lower().endswith(".svg"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                svg_data = f.read()
-            try:
-                st.image(svg_data, width="stretch")
-            except TypeError:
-                st.image(svg_data, use_column_width=True)
-        except Exception as e:
-            st.exception(e)
-        return
-
-    try:
-        hero = load_hero_logo(path, target_width=1920)
-        try:
-            st.image(hero, width="stretch")       # 최신 Streamlit
-        except TypeError:
-            st.image(hero, use_column_width=True) # 구버전 폴백
-    except Exception as e:
-        st.exception(e)
-
-
-# ------------------ SerpAPI 웹검색 툴 ------------------
+#✅ SerpAPI 검색 툴 정의
 def search_web():
     search = SerpAPIWrapper()
-
+    
     def run_with_source(query: str) -> str:
         results = search.results(query)
         organic = results.get("organic_results", [])
@@ -121,24 +28,22 @@ def search_web():
             title = r.get("title")
             link = r.get("link")
             source = r.get("source")
-            snippet = r.get("snippet", "")
+            snippet = r.get("snippet")  # ✅ snippet 추가
             if link:
-                formatted.append(f"- {title} ({source})\n  {snippet}")
+                formatted.append(f"- [{title}]({link}) ({source})\n  {snippet}")
             else:
                 formatted.append(f"- {title} (출처: {source})\n  {snippet}")
         return "\n".join(formatted) if formatted else "검색 결과가 없습니다."
-
+    
     return Tool(
         name="web_search",
         func=run_with_source,
-        description="실시간 뉴스 및 웹 정보를 검색합니다. (제목/출처/링크/스니펫 반환)"
+        description="실시간 뉴스 및 웹 정보를 검색할 때 사용합니다. 결과는 제목+출처+링크+간단요약(snippet) 형태로 반환됩니다."
     )
 
-
-# ------------------ PDF 로드 → 벡터DB → 검색툴 생성 ------------------
+# ✅ PDF 업로드 → 벡터DB → 검색 툴 생성
 def load_pdf_files(uploaded_files):
     all_documents = []
-
     for uploaded_file in uploaded_files:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.read())
@@ -146,155 +51,115 @@ def load_pdf_files(uploaded_files):
 
         loader = PyPDFLoader(tmp_file_path)
         documents = loader.load()
-        for d in documents:
-            d.metadata["file_name"] = uploaded_file.name  # 원본 업로드 파일명 보존
         all_documents.extend(documents)
 
-    # 분할
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     split_docs = text_splitter.split_documents(all_documents)
 
-    # 파일별 그룹핑 (요약용)
-    grouped_by_file = {}
-    for d in split_docs:
-        fname = d.metadata.get("file_name", "unknown.pdf")
-        grouped_by_file.setdefault(fname, []).append(d)
-
-    # 벡터DB
     vector = FAISS.from_documents(split_docs, OpenAIEmbeddings())
-    retriever = vector.as_retriever(search_kwargs={"k": 5})
+    retriever = vector.as_retriever()
 
-    # PDF 검색 툴: 스니펫 + (파일명, 페이지)
-    def run_pdf_search(query: str) -> str:
-        docs = retriever.get_relevant_documents(query)
-        if not docs:
-            return "PDF에서 관련 정보를 찾지 못했습니다."
-        lines = []
-        for i, d in enumerate(docs[:5]):
-            file_name = d.metadata.get("file_name") or os.path.basename(d.metadata.get("source", ""))
-            page_meta = d.metadata.get("page")
-            page_disp = page_meta + 1 if isinstance(page_meta, int) else page_meta
-            snippet = d.page_content.strip().replace("\n", " ")
-            lines.append(f"{i+1}. {snippet}\n   (출처: {file_name}, p.{page_disp})")
-        return "\n".join(lines)
-
-    retriever_tool = Tool(
+    retriever_tool = create_retriever_tool(
+        retriever,
         name="pdf_search",
-        func=run_pdf_search,
-        description="업로드된 PDF에서 검색합니다. (스니펫 + 출처: 파일명, 페이지)"
+        description="Use this tool to search information from the pdf document"
     )
+    return retriever_tool
 
-    return retriever_tool, grouped_by_file
+# ✅ Agent 대화 실행
+def chat_with_agent(user_input, agent_executor):
+    result = agent_executor({"input": user_input})
+    return result['output']
 
+# ✅ 세션별 히스토리 관리
+def get_session_history(session_ids):
+    if session_ids not in st.session_state.session_history:
+        st.session_state.session_history[session_ids] = ChatMessageHistory()
+    return st.session_state.session_history[session_ids]
 
-# ------------------ PDF 요약 ------------------
-def summarize_pdf_grouped(grouped_docs: dict, llm: ChatOpenAI, max_chunks_per_file: int = 8) -> dict:
-    summaries = {}
-    for file_name, docs in grouped_docs.items():
-        take = min(len(docs), max_chunks_per_file)
-        contents = "\n\n".join(d.page_content for d in docs[:take])
+# ✅ 이전 메시지 출력
+def print_messages():
+    for msg in st.session_state["messages"]:
+        st.chat_message(msg['role']).write(msg['content'])
 
-        prompt = (
-            "다음은 업로드된 PDF의 일부 내용입니다. 한국어로 간단하게 핵심 요약을 작성하세요.\n"
-            "- 5~8줄 요약\n- 중요한 수치/키워드/정의는 **굵게**\n- 문서 목적과 주요 결론 포함\n"
-            f"[문서: {file_name}] 내용:\n{contents}\n\n"
-            "이제 [요약]만 출력하세요."
-        )
-        ai_msg = llm.invoke(prompt)
-        summaries[file_name] = ai_msg.content
-    return summaries
+# ✅ 메인 실행
+def main():
+    st.set_page_config(page_title="AI 비서 백수석-엔지니어", layout="wide", page_icon="🤖")
 
+    with st.container():
+        st.image('./chatbot_logo.png', use_container_width=True)
+        st.markdown('---')
+        st.title("안녕하세요! RAG를 활용한 'AI 비서 백수석-엔지니어' 입니다")
 
-# ------------------ 세션 히스토리 ------------------
-def get_session_history(session_id: str) -> ChatMessageHistory:
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
     if "session_history" not in st.session_state:
         st.session_state["session_history"] = {}
-    if session_id not in st.session_state["session_history"]:
-        st.session_state["session_history"][session_id] = ChatMessageHistory()
-    return st.session_state["session_history"][session_id]
 
-
-# ------------------ 메시지 출력 ------------------
-def print_messages():
-    if "messages" not in st.session_state:
-        return
-    for msg in st.session_state["messages"]:
-        st.chat_message(msg["role"]).write(msg["content"])
-
-
-# ------------------ 메인 ------------------
-def main():
-    # 레이아웃은 wide로 (풀폭 사용)
-    st.set_page_config(page_title="AI 비서 백수석-엔지니어 (RAG)", layout="wide", page_icon="🤖")
-
-    # 상태 초기화
-    st.session_state.setdefault("messages", [])
-    st.session_state.setdefault("pdf_grouped", {})
-    st.session_state.setdefault("pdf_summaries", {})
-
-    # 헤더 (로고: 여백 제거 + 16:9 + 1920px + 컨테이너 풀폭)
-    with st.container():
-        render_logo("./chatbot_logo.png")  # 필요 시 경로/파일명 변경
-        st.markdown('---')
-        st.title("안녕하세요! RAG를 활용한 'AI 비서 백수석-엔지니어' 입니다 👋")
-
-    # 사이드바
     with st.sidebar:
         st.session_state["OPENAI_API"] = st.text_input("OPENAI API 키", placeholder="Enter Your API Key", type="password")
         st.session_state["SERPAPI_API"] = st.text_input("SERPAPI_API 키", placeholder="Enter Your API Key", type="password")
         st.markdown('---')
         pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader")
 
-        # PDF 요약 버튼 (파일 업로드 후 노출)
-        if pdf_docs:
-            if st.button("📌 PDF 요약 생성"):
-                if not st.session_state.get("pdf_grouped"):
-                    st.warning("먼저 키 입력 후 PDF를 로딩하세요.")
-                else:
-                    llm_for_summary = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                    with st.spinner("PDF 요약 생성 중..."):
-                        st.session_state["pdf_summaries"] = summarize_pdf_grouped(
-                            st.session_state["pdf_grouped"], llm_for_summary, max_chunks_per_file=8
-                        )
-                    st.success("PDF 요약 생성 완료!")
-
-    # 본문
-    st.markdown("### 대화")
-    user_input = st.chat_input("어서오세요. 오늘은 어떤 도움을 드릴까요?")
-
-    # 에이전트/툴 준비 (키가 있을 때만)
-    agent_executor = None
+    # ✅ 키 입력 확인
     if st.session_state["OPENAI_API"] and st.session_state["SERPAPI_API"]:
-        os.environ["OPENAI_API_KEY"] = st.session_state["OPENAI_API"]
-        os.environ["SERPAPI_API_KEY"] = st.session_state["SERPAPI_API"]
+        os.environ['OPENAI_API_KEY'] = st.session_state["OPENAI_API"]
+        os.environ['SERPAPI_API_KEY'] = st.session_state["SERPAPI_API"]
 
+        # 도구 정의
         tools = []
         if pdf_docs:
-            pdf_search_tool, grouped_by_file = load_pdf_files(pdf_docs)
-            tools.append(pdf_search_tool)
-            st.session_state["pdf_grouped"] = grouped_by_file
+            pdf_search = load_pdf_files(pdf_docs)
+            tools.append(pdf_search)
         tools.append(search_web())
 
-        # LLM
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        # LLM 설정
+        llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
 
-        # 프롬프트
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system",
-                 "반드시 한국어로 답변하세요. 당신은 친절한 업무용 어시스턴트입니다. "
-                 "당신의 이름은 `AI 비서 백수석-엔지니어`입니다. 대화 시작 시 짧게 자기소개하세요. "
-                 "PDF 기반이면 `pdf_search`를 우선 사용하고, '최신/현재/오늘' 질문이면 `web_search`를 사용하세요. "
-                 "응답 형식: 1) 핵심 요약 표 2) 필요 시 짧은 bullet 3) 마지막에 출처 표. "
-                 "항상 이모지를 포함하세요."),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{input}\n\nBe sure to include emoji in your responses."),
-                MessagesPlaceholder(variable_name="agent_scratchpad"),
+                "Be sure to answer in Korean. You are a helpful assistant. "
+                "Make sure to use the `pdf_search` tool for searching information from the pdf document. "
+                "If you can't find the information from the PDF document, use the `web_search` tool for searching information from the web. "
+                "If the user’s question contains words like '최신', '현재', or '오늘', you must ALWAYS use the `web_search` tool to ensure real-time information is retrieved. "
+                "Please always include emojis in your responses with a friendly tone. "
+                "Your name is `AI 비서 백수석-엔지니어`. Please introduce yourself at the beginning of the conversation."),
+                ("placeholder", "{chat_history}"),
+                ("human", "{input} \n\n Be sure to include emoji in your responses."),
+                ("placeholder", "{agent_scratchpad}"),
             ]
         )
 
+
         agent = create_tool_calling_agent(llm, tools, prompt)
-        agent_executor = AgentExecutor(
-            agent=agent,
-            tools=tools,
-           
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+        # 입력창
+        user_input = st.chat_input('어서오세요. 오늘은 어떤도움을 드릴까요?')
+
+        if user_input:
+            session_id = "default_session"
+            session_history = get_session_history(session_id)
+
+            if session_history.messages:
+                prev_msgs = [{"role": msg['role'], "content": msg['content']} for msg in session_history.messages]
+                response = chat_with_agent(user_input + "\n\nPrevious Messages: " + str(prev_msgs), agent_executor)
+            else:
+                response = chat_with_agent(user_input, agent_executor)
+
+            st.session_state["messages"].append({"role": "user", "content": user_input})
+            st.session_state["messages"].append({"role": "assistant", "content": response})
+
+            session_history.add_message({"role": "user", "content": user_input})
+            session_history.add_message({"role": "assistant", "content": response})
+
+        print_messages()
+
+    else:
+        st.warning("OpenAI API 키와 SerpAPI API 키를 입력하세요.")
+
+if __name__ == "__main__":
+    main()
+
