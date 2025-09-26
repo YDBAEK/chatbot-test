@@ -4,4 +4,4 @@ pypdf
 langchain_openai 
 langchain 
 langchain-community 
-faiss
+faiss-cpu
