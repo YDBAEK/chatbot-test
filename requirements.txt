@@ -1,1 +1,7 @@
 streamlit
+google-search-results
+pypdf
+langchain_openai 
+langchain 
+langchain-community 
+faiss
