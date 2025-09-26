@@ -13,52 +13,100 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageOps
 
 # ------------------ 전역 설정 ------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 # ------------------ 유틸: 16:9 패딩/리사이즈/여백 제거 ------------------
+def _fallback_resample():
+    """Pillow 버전에 따른 LANCZOS 폴백."""
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return Image.LANCZOS  # 구버전 Pillow
+
+def trim_uniform_border(img: Image.Image, tol: int = 10) -> Image.Image:
+    """
+    불투명 흰 여백 등 '균일 배경'을 자동 트리밍.
+    - 코너(0,0) 픽셀을 배경색으로 가정
+    - tol 기준으로 차이 나는 영역만 남기고 bbox 크롭
+    """
+    rgb = img.convert("RGB")
+    bg_color = rgb.getpixel((0, 0))
+    bg = Image.new("RGB", rgb.size, bg_color)
+    diff = ImageChops.difference(rgb, bg)
+    diff = ImageOps.grayscale(diff).point(lambda p: 255 if p > tol else 0)
+    bbox = diff.getbbox()
+    return img.crop(bbox) if bbox else img
+
 def pad_to_aspect(img: Image.Image, aspect: float = 16/9, bg=(255, 255, 255, 0)) -> Image.Image:
     w, h = img.size
     cur = w / h
     if abs(cur - aspect) < 1e-3:
         return img
     if cur > aspect:
-        # 가로가 더 긴 경우 → 세로 패딩
-        new_h = int(round(w / aspect))
-        new_w = w
+        new_h = int(round(w / aspect)); new_w = w
     else:
-        # 세로가 더 긴 경우 → 가로 패딩
-        new_w = int(round(h * aspect))
-        new_h = h
+        new_w = int(round(h * aspect)); new_h = h
     canvas = Image.new("RGBA", (new_w, new_h), bg)
-    ox = (new_w - w) // 2
-    oy = (new_h - h) // 2
+    ox = (new_w - w) // 2; oy = (new_h - h) // 2
     canvas.paste(img, (ox, oy), mask=img if img.mode == "RGBA" else None)
     return canvas
 
-
 def load_hero_logo(path: str, target_width: int = 1920) -> Image.Image:
     """
-    1) 투명 여백 자동 제거 → 2) 16:9 패딩 → 3) target_width(기본 1920)로 LANCZOS 리사이즈
+    1) 투명 여백 크롭 → 2) 균일 배경 여백 트리밍(흰 여백 등) → 3) 16:9 패딩 → 4) LANCZOS 리사이즈
     """
     img = Image.open(path)
     if img.mode != "RGBA":
         img = img.convert("RGBA")
-    # 1) 투명 여백 크롭
+
+    # (1) 투명 여백
     bbox = img.getchannel("A").getbbox()
     if bbox:
         img = img.crop(bbox)
-    # 2) 16:9 패딩
+
+    # (2) 흰 여백 등 균일 여백 제거
+    img = trim_uniform_border(img, tol=10)
+
+    # (3) 16:9 패딩
     img = pad_to_aspect(img, aspect=16/9)
-    # 3) 리사이즈 (가로 기준)
+
+    # (4) 리사이즈 (가로 기준)
+    resample = _fallback_resample()
     w, h = img.size
     if w != target_width:
         target_height = int(round(target_width * 9 / 16))
-        img = img.resize((target_width, target_height), resample=Image.Resampling.LANCZOS)
+        img = img.resize((target_width, target_height), resample=resample)
     return img
+
+def render_logo(path: str):
+    """
+    - SVG면 PIL 경로를 우회하고 바로 표시
+    - Streamlit 버전 차이: width='stretch' → 실패 시 use_column_width=True
+    """
+    if path.lower().endswith(".svg"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                svg_data = f.read()
+            try:
+                st.image(svg_data, width="stretch")
+            except TypeError:
+                st.image(svg_data, use_column_width=True)
+        except Exception as e:
+            st.exception(e)
+        return
+
+    try:
+        hero = load_hero_logo(path, target_width=1920)
+        try:
+            st.image(hero, width="stretch")       # 최신 Streamlit
+        except TypeError:
+            st.image(hero, use_column_width=True) # 구버전 폴백
+    except Exception as e:
+        st.exception(e)
 
 
 # ------------------ SerpAPI 웹검색 툴 ------------------
@@ -186,15 +234,7 @@ def main():
 
     # 헤더 (로고: 여백 제거 + 16:9 + 1920px + 컨테이너 풀폭)
     with st.container():
-        try:
-            hero = load_hero_logo("./chatbot_logo.png", target_width=1920)
-            # 최신 Streamlit: 컨테이너 폭 가득
-            st.image(hero, width="stretch")
-            # 구버전 호환 (필요 시 위 한 줄 대신 아래 사용)
-            # st.image(hero, use_column_width="always")
-        except Exception as e:
-            st.info(f"로고 이미지를 표시할 수 없습니다: {e}")
-
+        render_logo("./chatbot_logo.png")  # 필요 시 경로/파일명 변경
         st.markdown('---')
         st.title("안녕하세요! RAG를 활용한 'AI 비서 백수석-엔지니어' 입니다 👋")
 
@@ -257,44 +297,4 @@ def main():
         agent_executor = AgentExecutor(
             agent=agent,
             tools=tools,
-            verbose=True,
-            handle_parsing_errors=True
-        )
-
-    # 대화 처리
-    session_id = "default_session"
-    session_history = get_session_history(session_id)
-
-    if user_input:
-        if agent_executor:
-            with st.spinner("답변 생성 중..."):
-                result = agent_executor.invoke({
-                    "input": user_input,
-                    "chat_history": session_history.messages  # 핵심: 히스토리 전달
-                })
-                response = result["output"]
-        else:
-            response = "⚠️ 먼저 사이드바에 OpenAI/SerpAPI 키를 입력해주세요."
-
-        # UI 메시지 기록
-        st.session_state["messages"].append({"role": "user", "content": user_input})
-        st.session_state["messages"].append({"role": "assistant", "content": response})
-
-        # LangChain 히스토리 기록
-        session_history.add_user_message(user_input)
-        session_history.add_ai_message(response)
-
-    # 메시지 출력
-    print_messages()
-
-    # PDF 요약 출력
-    if st.session_state["pdf_summaries"]:
-        st.markdown("---")
-        st.subheader("📚 업로드된 PDF 요약")
-        for fname, summ in st.session_state["pdf_summaries"].items():
-            with st.expander(f"📝 {fname} 요약 보기"):
-                st.write(summ)
-
-
-if __name__ == "__main__":
-    main()
+           
