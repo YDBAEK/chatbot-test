@@ -146,7 +146,7 @@ def main():
     # 헤더
     with st.container():
         try:
-            st.image("./chatbot_logo.png", width="stretch", use_container_width=True)
+            st.image("./chatbot_logo.png", width="stretch", use_container_width=True,use_column_width="always")
         except Exception:
             st.info("로고 이미지를 찾지 못했습니다. (chatbot_logo.png)")
         st.markdown('---')
