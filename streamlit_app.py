@@ -12,14 +12,56 @@ from langchain.agents import Tool, create_tool_calling_agent, AgentExecutor
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain.schema import HumanMessage, AIMessage
 
+from PIL import Image
 
-# --------- 전역 설정 ----------
+# ------------------ 전역 설정 ------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
-# ✅ SerpAPI 검색 툴
+# ------------------ 유틸: 16:9 패딩/리사이즈/여백 제거 ------------------
+def pad_to_aspect(img: Image.Image, aspect: float = 16/9, bg=(255, 255, 255, 0)) -> Image.Image:
+    w, h = img.size
+    cur = w / h
+    if abs(cur - aspect) < 1e-3:
+        return img
+    if cur > aspect:
+        # 가로가 더 긴 경우 → 세로 패딩
+        new_h = int(round(w / aspect))
+        new_w = w
+    else:
+        # 세로가 더 긴 경우 → 가로 패딩
+        new_w = int(round(h * aspect))
+        new_h = h
+    canvas = Image.new("RGBA", (new_w, new_h), bg)
+    ox = (new_w - w) // 2
+    oy = (new_h - h) // 2
+    canvas.paste(img, (ox, oy), mask=img if img.mode == "RGBA" else None)
+    return canvas
+
+
+def load_hero_logo(path: str, target_width: int = 1920) -> Image.Image:
+    """
+    1) 투명 여백 자동 제거 → 2) 16:9 패딩 → 3) target_width(기본 1920)로 LANCZOS 리사이즈
+    """
+    img = Image.open(path)
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    # 1) 투명 여백 크롭
+    bbox = img.getchannel("A").getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    # 2) 16:9 패딩
+    img = pad_to_aspect(img, aspect=16/9)
+    # 3) 리사이즈 (가로 기준)
+    w, h = img.size
+    if w != target_width:
+        target_height = int(round(target_width * 9 / 16))
+        img = img.resize((target_width, target_height), resample=Image.Resampling.LANCZOS)
+    return img
+
+
+# ------------------ SerpAPI 웹검색 툴 ------------------
 def search_web():
     search = SerpAPIWrapper()
 
@@ -45,7 +87,7 @@ def search_web():
     )
 
 
-# ✅ PDF 업로드 → 벡터DB → 검색 툴 생성 (+ 메타데이터 보강)
+# ------------------ PDF 로드 → 벡터DB → 검색툴 생성 ------------------
 def load_pdf_files(uploaded_files):
     all_documents = []
 
@@ -57,8 +99,7 @@ def load_pdf_files(uploaded_files):
         loader = PyPDFLoader(tmp_file_path)
         documents = loader.load()
         for d in documents:
-            d.metadata["file_name"] = uploaded_file.name  # 원본 업로드 파일명
-
+            d.metadata["file_name"] = uploaded_file.name  # 원본 업로드 파일명 보존
         all_documents.extend(documents)
 
     # 분할
@@ -71,7 +112,7 @@ def load_pdf_files(uploaded_files):
         fname = d.metadata.get("file_name", "unknown.pdf")
         grouped_by_file.setdefault(fname, []).append(d)
 
-    # 벡터DB 생성
+    # 벡터DB
     vector = FAISS.from_documents(split_docs, OpenAIEmbeddings())
     retriever = vector.as_retriever(search_kwargs={"k": 5})
 
@@ -98,7 +139,7 @@ def load_pdf_files(uploaded_files):
     return retriever_tool, grouped_by_file
 
 
-# ✅ PDF 요약
+# ------------------ PDF 요약 ------------------
 def summarize_pdf_grouped(grouped_docs: dict, llm: ChatOpenAI, max_chunks_per_file: int = 8) -> dict:
     summaries = {}
     for file_name, docs in grouped_docs.items():
@@ -116,7 +157,7 @@ def summarize_pdf_grouped(grouped_docs: dict, llm: ChatOpenAI, max_chunks_per_fi
     return summaries
 
 
-# ✅ 세션 히스토리
+# ------------------ 세션 히스토리 ------------------
 def get_session_history(session_id: str) -> ChatMessageHistory:
     if "session_history" not in st.session_state:
         st.session_state["session_history"] = {}
@@ -125,7 +166,7 @@ def get_session_history(session_id: str) -> ChatMessageHistory:
     return st.session_state["session_history"][session_id]
 
 
-# ✅ 이전 메시지 출력 (UI)
+# ------------------ 메시지 출력 ------------------
 def print_messages():
     if "messages" not in st.session_state:
         return
@@ -133,9 +174,9 @@ def print_messages():
         st.chat_message(msg["role"]).write(msg["content"])
 
 
-# ✅ 메인
+# ------------------ 메인 ------------------
 def main():
-    # 반드시 첫 Streamlit 호출
+    # 레이아웃은 wide로 (풀폭 사용)
     st.set_page_config(page_title="AI 비서 백수석-엔지니어 (RAG)", layout="wide", page_icon="🤖")
 
     # 상태 초기화
@@ -143,12 +184,17 @@ def main():
     st.session_state.setdefault("pdf_grouped", {})
     st.session_state.setdefault("pdf_summaries", {})
 
-    # 헤더
+    # 헤더 (로고: 여백 제거 + 16:9 + 1920px + 컨테이너 풀폭)
     with st.container():
         try:
-            st.image("./chatbot_logo.png", width="stretch", use_container_width=True,use_column_width="always")
-        except Exception:
-            st.info("로고 이미지를 찾지 못했습니다. (chatbot_logo.png)")
+            hero = load_hero_logo("./chatbot_logo.png", target_width=1920)
+            # 최신 Streamlit: 컨테이너 폭 가득
+            st.image(hero, width="stretch")
+            # 구버전 호환 (필요 시 위 한 줄 대신 아래 사용)
+            # st.image(hero, use_column_width="always")
+        except Exception as e:
+            st.info(f"로고 이미지를 표시할 수 없습니다: {e}")
+
         st.markdown('---')
         st.title("안녕하세요! RAG를 활용한 'AI 비서 백수석-엔지니어' 입니다 👋")
 
@@ -159,7 +205,7 @@ def main():
         st.markdown('---')
         pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader")
 
-        # 요약 버튼은 파일 업로드 이후 노출
+        # PDF 요약 버튼 (파일 업로드 후 노출)
         if pdf_docs:
             if st.button("📌 PDF 요약 생성"):
                 if not st.session_state.get("pdf_grouped"):
@@ -172,11 +218,11 @@ def main():
                         )
                     st.success("PDF 요약 생성 완료!")
 
-    # 본문 — 키 미입력 시에도 기본 UI 보이도록 먼저 렌더
+    # 본문
     st.markdown("### 대화")
     user_input = st.chat_input("어서오세요. 오늘은 어떤 도움을 드릴까요?")
 
-    # 키 확인 후 에이전트/툴 준비
+    # 에이전트/툴 준비 (키가 있을 때만)
     agent_executor = None
     if st.session_state["OPENAI_API"] and st.session_state["SERPAPI_API"]:
         os.environ["OPENAI_API_KEY"] = st.session_state["OPENAI_API"]
@@ -192,7 +238,7 @@ def main():
         # LLM
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-        # Prompt
+        # 프롬프트
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system",
@@ -224,17 +270,17 @@ def main():
             with st.spinner("답변 생성 중..."):
                 result = agent_executor.invoke({
                     "input": user_input,
-                    "chat_history": session_history.messages  # <-- 핵심 수정
+                    "chat_history": session_history.messages  # 핵심: 히스토리 전달
                 })
                 response = result["output"]
         else:
             response = "⚠️ 먼저 사이드바에 OpenAI/SerpAPI 키를 입력해주세요."
 
-        # UI 기록
+        # UI 메시지 기록
         st.session_state["messages"].append({"role": "user", "content": user_input})
         st.session_state["messages"].append({"role": "assistant", "content": response})
 
-        # LangChain 히스토리 기록 (BaseMessage)
+        # LangChain 히스토리 기록
         session_history.add_user_message(user_input)
         session_history.add_ai_message(response)
 
